@@ -21,16 +21,103 @@
 #include <zephyr/logging/log.h>
 LOG_MODULE_REGISTER(uhc_dwc2, CONFIG_UHC_DRIVER_LOG_LEVEL);
 
+enum uhc_dwc2_speed {
+	UHC_DWC2_SPEED_HIGH = 0,
+	UHC_DWC2_SPEED_FULL = 1,
+	UHC_DWC2_SPEED_LOW = 2,
+};
+
 K_THREAD_STACK_DEFINE(uhc_dwc2_stack, CONFIG_UHC_DWC2_STACK_SIZE);
 
-#define UHC_DWC2_CHAN_REG(base, chan_idx)                                                          \
-	((struct usb_dwc2_host_chan *)(((mem_addr_t)(base)) + 0x500UL + ((chan_idx) * 0x20UL)))
 
-struct uhc_dwc2_data {
+#define UHC_DWC2_CHAN_REG(base, chan_idx)                                                          \
+	((struct usb_dwc2_host_chan *)(((mem_addr_t)(base)) + USB_DWC2_HCCHAR0 + ((chan_idx) * 0x20UL)))
+
+#define USB_DWC2_HPRT_W1C_MSK	(USB_DWC2_HPRT_PRTENA |		\
+								USB_DWC2_HPRT_PRTCONNDET |	\
+								USB_DWC2_HPRT_PRTENCHNG |	\
+	 							USB_DWC2_HPRT_PRTOVRCURRCHNG)
+
+								struct uhc_dwc2_data {
 	struct k_sem irq_sem;
 	struct k_thread thread;
 	struct k_event event;
 };
+
+static inline void dwc2_hal_toggle_reset(struct usb_dwc2_reg *const dwc2, const bool reset_on)
+{
+	uint32_t hprt;
+
+	hprt = sys_read32((mem_addr_t)&dwc2->hprt);
+	if (reset_on) {
+		hprt |= USB_DWC2_HPRT_PRTRST;
+	} else {
+		hprt &= ~USB_DWC2_HPRT_PRTRST;
+	}
+	sys_write32(hprt & (~USB_DWC2_HPRT_W1C_MSK), (mem_addr_t)&dwc2->hprt);
+}
+
+static inline void dwc2_port_set_power(struct usb_dwc2_reg *const dwc2, const bool power_on)
+{
+	uint32_t hprt;
+
+	hprt = sys_read32((mem_addr_t)&dwc2->hprt);
+	if (power_on) {
+		hprt |= USB_DWC2_HPRT_PRTPWR;
+	} else {
+		hprt &= ~USB_DWC2_HPRT_PRTPWR;
+	}
+	sys_write32(hprt & (~USB_DWC2_HPRT_W1C_MSK), (mem_addr_t)&dwc2->hprt);
+}
+
+static inline enum uhc_dwc2_speed dwc2_hal_get_port_speed(struct usb_dwc2_reg *const dwc2)
+{
+	uint32_t hprt;
+
+	hprt = sys_read32((mem_addr_t)&dwc2->hprt);
+	return (hprt & USB_DWC2_HPRT_PRTSPD_MASK) >> USB_DWC2_HPRT_PRTSPD_POS;
+}
+
+static inline void dwc2_hal_port_enable(struct usb_dwc2_reg *const dwc2)
+{
+	const enum uhc_dwc2_speed speed = dwc2_hal_get_port_speed(dwc2);
+	uint32_t hcfg = sys_read32((mem_addr_t)&dwc2->hcfg);
+	uint32_t hfir = sys_read32((mem_addr_t)&dwc2->hfir);
+	uint32_t ghwcfg2 = sys_read32((mem_addr_t)&dwc2->ghwcfg2);
+	uint8_t fslspclksel;
+	uint16_t frint;
+
+	/* We can select Buffer DMA of Scatter-Gather DMA mode here: Buffer DMA by default */
+	hcfg &= ~USB_DWC2_HCFG_DESCDMA;
+
+	/* Disable periodic scheduling, will enable later */
+	hcfg &= ~USB_DWC2_HCFG_PERSCHEDENA;
+
+	if (usb_dwc2_get_ghwcfg2_hsphytype(ghwcfg2) == 0) {
+		/* Indicate to the OTG core what speed the PHY clock is at
+		 * Note: FSLS PHY has an implicit 8 divider applied when in LS mode,
+		 * so the values of FSLSPclkSel and FrInt have to be adjusted accordingly.
+		 */
+		fslspclksel = (speed == UHC_DWC2_SPEED_FULL) ? 1 : 2;
+		hcfg &= ~USB_DWC2_HCFG_FSLSPCLKSEL_MASK;
+		hcfg |= (fslspclksel << USB_DWC2_HCFG_FSLSPCLKSEL_POS);
+
+		/* Disable dynamic loading */
+		hfir &= ~USB_DWC2_HFIR_HFIRRLDCTRL;
+		/* Set frame interval to be equal to 1ms
+		 * Note: FSLS PHY has an implicit 8 divider applied when in LS mode,
+		 * so the values of FSLSPclkSel and FrInt have to be adjusted accordingly.
+		 */
+		frint = (speed == UHC_DWC2_SPEED_FULL) ? 48000 : 6000;
+		hfir &= ~USB_DWC2_HFIR_FRINT_MASK;
+		hfir |= (frint << USB_DWC2_HFIR_FRINT_POS);
+
+		sys_write32(hcfg, (mem_addr_t)&dwc2->hcfg);
+		sys_write32(hfir, (mem_addr_t)&dwc2->hfir);
+	} else {
+		LOG_ERR("Configuring clocks for HS PHY is not implemented");
+	}
+}
 
 static inline void dwc2_hal_init_gusbcfg(struct usb_dwc2_reg *const dwc2)
 {
@@ -73,6 +160,7 @@ static inline void dwc2_hal_init_gusbcfg(struct usb_dwc2_reg *const dwc2)
 		}
 		sys_write32(gusbcfg, (mem_addr_t)&dwc2->gusbcfg);
 	} else {
+		LOG_WRN("Fullspeed PHY init");
 		sys_set_bits((mem_addr_t)&dwc2->gusbcfg, USB_DWC2_GUSBCFG_PHYSEL_USB11);
 	}
 }
@@ -174,7 +262,14 @@ static int dwc2_hal_init_host(struct usb_dwc2_reg *const dwc2)
 
 static void uhc_dwc2_isr_handler(const struct device *dev)
 {
-	/* TODO: Interrupt handling */
+	const struct uhc_dwc2_config *const config = dev->config;
+	struct usb_dwc2_reg *const dwc2 = config->base;
+
+	/* Read and clear core interrupt status */
+	uint32_t core_intrs = sys_read32((mem_addr_t)&dwc2->gintsts);
+	sys_write32(core_intrs, (mem_addr_t)&dwc2->gintsts);
+
+	LOG_WRN("GINTSTS=%08X", core_intrs);
 }
 
 static ALWAYS_INLINE void uhc_dwc2_thread_handler(void *const arg)
@@ -346,7 +441,7 @@ static int uhc_dwc2_init(const struct device *const dev)
 		return ret;
 	}
 
-	/* 4. Init DWC2 controller as host */
+	/* 4. Init DWC2 controller as a host */
 
 	ret = dwc2_hal_init_host(dwc2);
 	if (ret) {
@@ -361,6 +456,7 @@ static int uhc_dwc2_init(const struct device *const dev)
 static int uhc_dwc2_enable(const struct device *const dev)
 {
 	const struct uhc_dwc2_config *const config = dev->config;
+	struct usb_dwc2_reg *const dwc2 = config->base;
 
 	int ret;
 
@@ -389,6 +485,10 @@ static int uhc_dwc2_enable(const struct device *const dev)
 	config->irq_enable_func(dev);
 
 	/* 3. Power up root port */
+	sys_clear_bits((mem_addr_t)&dwc2->haintmsk, 0xFFFFFFFFUL);
+	sys_set_bits((mem_addr_t)&dwc2->gintmsk, USB_DWC2_GINTSTS_PRTINT | USB_DWC2_GINTSTS_HCHINT);
+
+	dwc2_port_set_power(dwc2, true);
 	// ret = uhc_dwc2_power_on(dev);
 	// if (ret) {
 	// 	LOG_ERR("Failed to power on port: %d", ret);
@@ -403,7 +503,7 @@ static int uhc_dwc2_enable(const struct device *const dev)
 static int uhc_dwc2_disable(const struct device *const dev)
 {
 	LOG_WRN("%s has not been implemented", __func__);
-	
+
 	/* 0. TODO: Check ongoing transfer? */
 
 	/* 1. Disable IRQ */
