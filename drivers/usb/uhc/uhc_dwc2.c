@@ -264,12 +264,22 @@ static void uhc_dwc2_isr_handler(const struct device *dev)
 {
 	const struct uhc_dwc2_config *const config = dev->config;
 	struct usb_dwc2_reg *const dwc2 = config->base;
+	uint32_t core_intrs = 0;
+	uint32_t port_intrs = 0;
 
 	/* Read and clear core interrupt status */
 	uint32_t core_intrs = sys_read32((mem_addr_t)&dwc2->gintsts);
 	sys_write32(core_intrs, (mem_addr_t)&dwc2->gintsts);
 
-	LOG_WRN("GINTSTS=%08X", core_intrs);
+	/* If port interruprt - read and clear */
+	if (core_intrs & USB_DWC2_GINTSTS_PRTINT) {
+		port_intrs = sys_read32((mem_addr_t)&dwc2->hprt);
+		/* Clear the interrupt status by writing 1 to the W1C bits, except the PRTENA bit */
+		sys_write32(port_intrs & (~USB_DWC2_HPRT_PRTENA), (mem_addr_t)&dwc2->hprt);
+	}
+
+	LOG_WRN("GINTSTS=%08Xh, HPRT=%08Xh", core_intrs, port_intrs);
+
 }
 
 static ALWAYS_INLINE void uhc_dwc2_thread_handler(void *const arg)
