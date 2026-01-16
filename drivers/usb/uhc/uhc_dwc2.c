@@ -32,27 +32,23 @@ struct uhc_dwc2_data {
 	struct k_event event;
 };
 
-static int dwc2_hal_init_gusbcfg(struct usb_dwc2_reg *const dwc2)
+static inline void dwc2_hal_init_gusbcfg(struct usb_dwc2_reg *const dwc2)
 {
+	uint32_t gusbcfg = sys_read32((mem_addr_t)&dwc2->gusbcfg);
+	uint32_t ghwcfg2 = sys_read32((mem_addr_t)&dwc2->ghwcfg2);
+	uint32_t ghwcfg4 = sys_read32((mem_addr_t)&dwc2->ghwcfg4);
+	
 	/* Enable Host mode */
 	sys_set_bits((mem_addr_t)&dwc2->gusbcfg, USB_DWC2_GUSBCFG_FORCEHSTMODE);
 	/* Wait until core is in host mode */
 	while ((sys_read32((mem_addr_t)&dwc2->gintsts) & USB_DWC2_GINTSTS_CURMOD) != 1) {
 	}
 
-	// cfg->hsphytype = usb_dwc2_get_ghwcfg2_hsphytype(ghwcfg2);
-	// cfg->fsphytype = usb_dwc2_get_ghwcfg2_fsphytype(ghwcfg2);
-	// cfg->phydatawidth = usb_dwc2_get_ghwcfg4_phydatawidth(ghwcfg4);
-
-	/* Init PHY based on the speed */
-
-	if (priv->const_cfg.hsphytype != 0) {
-		uint32_t gusbcfg = sys_read32((mem_addr_t)&dwc2->gusbcfg);
-
+	if (usb_dwc2_get_ghwcfg2_hsphytype(ghwcfg2) != 0) {
 		/* De-select FS PHY */
 		gusbcfg &= ~USB_DWC2_GUSBCFG_PHYSEL_USB11;
 
-		if (priv->const_cfg.hsphytype == USB_DWC2_GHWCFG2_HSPHYTYPE_ULPI) {
+		if (usb_dwc2_get_ghwcfg2_hsphytype(ghwcfg2) == USB_DWC2_GHWCFG2_HSPHYTYPE_ULPI) {
 			LOG_WRN("Highspeed ULPI PHY init");
 			/* Select ULPI PHY (external) */
 			gusbcfg |= USB_DWC2_GUSBCFG_ULPI_UTMI_SEL_ULPI;
@@ -69,7 +65,7 @@ static int dwc2_hal_init_gusbcfg(struct usb_dwc2_reg *const dwc2)
 			/* Select UTMI+ PHY (internal) */
 			gusbcfg &= ~USB_DWC2_GUSBCFG_ULPI_UTMI_SEL_ULPI;
 			/* Set 16-bit interface if supported */
-			if (priv->const_cfg.phydatawidth) {
+			if (usb_dwc2_get_ghwcfg4_phydatawidth(ghwcfg4)) {
 				gusbcfg |= USB_DWC2_GUSBCFG_PHYIF_16_BIT;
 			} else {
 				gusbcfg &= ~USB_DWC2_GUSBCFG_PHYIF_16_BIT;
@@ -79,6 +75,39 @@ static int dwc2_hal_init_gusbcfg(struct usb_dwc2_reg *const dwc2)
 	} else {
 		sys_set_bits((mem_addr_t)&dwc2->gusbcfg, USB_DWC2_GUSBCFG_PHYSEL_USB11);
 	}
+}
+
+static inline int dwc2_hal_init_gahbcfg(struct usb_dwc2_reg *const dwc2)
+{
+	uint32_t ghwcfg2 = sys_read32((mem_addr_t)&dwc2->ghwcfg2);
+
+	/* Disable Global Interrupt */
+	sys_clear_bits((mem_addr_t)&dwc2->gahbcfg, USB_DWC2_GAHBCFG_GLBINTRMASK);
+
+	/* TODO: Set AHB burst mode for some ECO only for ESP32S2 */
+	/* Make config quirk? */
+
+	/* TODO: Disable HNP and SRP capabilities */
+	/* Also move to quirk? */
+
+	/* Configure AHB */
+	uint32_t gahbcfg = sys_read32((mem_addr_t)&dwc2->gahbcfg);
+	gahbcfg |= USB_DWC2_GAHBCFG_NPTXFEMPLVL;
+	gahbcfg &= ~USB_DWC2_GAHBCFG_HBSTLEN_MASK;
+	gahbcfg |= (USB_DWC2_GAHBCFG_HBSTLEN_INCR16 << USB_DWC2_GAHBCFG_HBSTLEN_POS);
+	sys_write32(gahbcfg, (mem_addr_t)&dwc2->gahbcfg);
+
+	if (usb_dwc2_get_ghwcfg2_otgarch(ghwcfg2) == USB_DWC2_GHWCFG2_OTGARCH_INTERNALDMA) {
+		sys_set_bits((mem_addr_t)&dwc2->gahbcfg, USB_DWC2_GAHBCFG_DMAEN);
+	} else {
+		/* TODO: Implement Simple mode */
+		LOG_ERR("DMA isn't supported by the hardware");
+		return -ENXIO;
+	}
+
+	/* Enable Global Interrupt */
+	sys_set_bits((mem_addr_t)&dwc2->gahbcfg, USB_DWC2_GAHBCFG_GLBINTRMASK);
+	return 0;
 }
 
 static int dwc2_hal_core_reset(struct usb_dwc2_reg *const dwc2, const k_timeout_t timeout)
@@ -121,14 +150,13 @@ static int dwc2_hal_core_reset(struct usb_dwc2_reg *const dwc2, const k_timeout_
 
 static int dwc2_hal_init_host(struct usb_dwc2_reg *const dwc2)
 {
-	/* Pre-calculate FIFO settings */
-	// uhc_dwc2_config_fifo_fixed_dma(&priv->const_cfg, &priv->fifo);
+	int ret;
 
 	/* Init GUSBCFG */
-	dwc2_hal_init_gusbcfg(dev);
+	dwc2_hal_init_gusbcfg(dwc2);
 
 	/* Init GAHBCFG */
-	dwc2_hal_init_gahbcfg(dev);
+	ret = dwc2_hal_init_gahbcfg(dwc2);
 
 	/* Clear interrupts */
 	sys_clear_bits((mem_addr_t)&dwc2->gintmsk, 0xFFFFFFFFUL);
@@ -137,6 +165,8 @@ static int dwc2_hal_init_host(struct usb_dwc2_reg *const dwc2)
 	/* Clear status */
 	uint32_t core_intrs = sys_read32((mem_addr_t)&dwc2->gintsts);
 	sys_write32(core_intrs, (mem_addr_t)&dwc2->gintsts);
+
+	return ret;
 }
 
 
@@ -317,6 +347,7 @@ static int uhc_dwc2_init(const struct device *const dev)
 	}
 
 	/* 4. Init DWC2 controller as host */
+
 	ret = dwc2_hal_init_host(dwc2);
 	if (ret) {
 		return ret;
@@ -341,6 +372,9 @@ static int uhc_dwc2_enable(const struct device *const dev)
 
 	/* 1. Init root port */
 
+	/* Pre-calculate FIFO settings */
+	// uhc_dwc2_config_fifo_fixed_dma(&priv->const_cfg, &priv->fifo);
+
 	// priv->channels.hdls = k_malloc(priv->const_cfg.numchannels * sizeof(uhc_dwc2_channel_t*));
 	// if (priv->channels.hdls == NULL) {
 	// 	LOG_ERR("Failed to allocate channel handles");
@@ -350,7 +384,6 @@ static int uhc_dwc2_enable(const struct device *const dev)
 	// for (uint8_t i = 0; i < priv->const_cfg.numchannels; i++) {
 	// 	priv->channels.hdls[i] = NULL;
 	// }
-
 
 	/* 2. Enable IRQ */
 	config->irq_enable_func(dev);
@@ -370,6 +403,12 @@ static int uhc_dwc2_enable(const struct device *const dev)
 static int uhc_dwc2_disable(const struct device *const dev)
 {
 	LOG_WRN("%s has not been implemented", __func__);
+	
+	/* 0. TODO: Check ongoing transfer? */
+
+	/* 1. Disable IRQ */
+
+	/* 2. Power down root port */
 
 	return -ENOSYS;
 }
