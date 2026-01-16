@@ -32,6 +32,116 @@ struct uhc_dwc2_data {
 	struct k_event event;
 };
 
+static int dwc2_hal_init_gusbcfg(struct usb_dwc2_reg *const dwc2)
+{
+	/* Enable Host mode */
+	sys_set_bits((mem_addr_t)&dwc2->gusbcfg, USB_DWC2_GUSBCFG_FORCEHSTMODE);
+	/* Wait until core is in host mode */
+	while ((sys_read32((mem_addr_t)&dwc2->gintsts) & USB_DWC2_GINTSTS_CURMOD) != 1) {
+	}
+
+	// cfg->hsphytype = usb_dwc2_get_ghwcfg2_hsphytype(ghwcfg2);
+	// cfg->fsphytype = usb_dwc2_get_ghwcfg2_fsphytype(ghwcfg2);
+	// cfg->phydatawidth = usb_dwc2_get_ghwcfg4_phydatawidth(ghwcfg4);
+
+	/* Init PHY based on the speed */
+
+	if (priv->const_cfg.hsphytype != 0) {
+		uint32_t gusbcfg = sys_read32((mem_addr_t)&dwc2->gusbcfg);
+
+		/* De-select FS PHY */
+		gusbcfg &= ~USB_DWC2_GUSBCFG_PHYSEL_USB11;
+
+		if (priv->const_cfg.hsphytype == USB_DWC2_GHWCFG2_HSPHYTYPE_ULPI) {
+			LOG_WRN("Highspeed ULPI PHY init");
+			/* Select ULPI PHY (external) */
+			gusbcfg |= USB_DWC2_GUSBCFG_ULPI_UTMI_SEL_ULPI;
+			/* ULPI is always 8-bit interface */
+			gusbcfg &= ~USB_DWC2_GUSBCFG_PHYIF_16_BIT;
+			/* ULPI select single data rate */
+			gusbcfg &= ~USB_DWC2_GUSBCFG_DDR_DOUBLE;
+			/* Default internal VBUS Indicator and Drive */
+			gusbcfg &= ~(USB_DWC2_GUSBCFG_ULPIEVBUSD | USB_DWC2_GUSBCFG_ULPIEVBUSI);
+			/* Disable FS/LS ULPI and Supend mode */
+			gusbcfg &= ~(USB_DWC2_GUSBCFG_ULPIFSLS | USB_DWC2_GUSBCFG_ULPICLK_SUSM);
+		} else {
+			LOG_WRN("Highspeed UTMI+ PHY init");
+			/* Select UTMI+ PHY (internal) */
+			gusbcfg &= ~USB_DWC2_GUSBCFG_ULPI_UTMI_SEL_ULPI;
+			/* Set 16-bit interface if supported */
+			if (priv->const_cfg.phydatawidth) {
+				gusbcfg |= USB_DWC2_GUSBCFG_PHYIF_16_BIT;
+			} else {
+				gusbcfg &= ~USB_DWC2_GUSBCFG_PHYIF_16_BIT;
+			}
+		}
+		sys_write32(gusbcfg, (mem_addr_t)&dwc2->gusbcfg);
+	} else {
+		sys_set_bits((mem_addr_t)&dwc2->gusbcfg, USB_DWC2_GUSBCFG_PHYSEL_USB11);
+	}
+}
+
+static int dwc2_hal_core_reset(struct usb_dwc2_reg *const dwc2, const k_timeout_t timeout)
+{
+	const k_timepoint_t timepoint = sys_timepoint_calc(timeout);
+
+	/* Check AHB master idle state */
+	while ((sys_read32((mem_addr_t)&dwc2->grstctl) & USB_DWC2_GRSTCTL_AHBIDLE) == 0) {
+		if (sys_timepoint_expired(timepoint)) {
+			LOG_ERR("Wait for AHB idle timeout, GRSTCTL 0x%08x",
+				sys_read32((mem_addr_t)&dwc2->grstctl));
+			return -EIO;
+		}
+
+		k_busy_wait(1);
+	}
+
+	/* Apply Core Soft Reset */
+	sys_write32(USB_DWC2_GRSTCTL_CSFTRST, (mem_addr_t)&dwc2->grstctl);
+
+	/* Wait for reset to complete */
+	while ((sys_read32((mem_addr_t)&dwc2->grstctl) & USB_DWC2_GRSTCTL_CSFTRST) != 0 &&
+	       (sys_read32((mem_addr_t)&dwc2->grstctl) & USB_DWC2_GRSTCTL_CSFTRSTDONE) == 0) {
+		if (sys_timepoint_expired(timepoint)) {
+			LOG_ERR("Wait for CSR done timeout, GRSTCTL 0x%08x",
+				sys_read32((mem_addr_t)&dwc2->grstctl));
+			return -EIO;
+		}
+
+		k_busy_wait(1);
+	}
+
+	/* CSFTRSTDONE is W1C so the write must have the bit set to clear it */
+	sys_clear_bits((mem_addr_t)&dwc2->grstctl, USB_DWC2_GRSTCTL_CSFTRST);
+
+	LOG_DBG("DWC2 core reset done");
+
+	return 0;
+}
+
+static int dwc2_hal_init_host(struct usb_dwc2_reg *const dwc2)
+{
+	/* Pre-calculate FIFO settings */
+	// uhc_dwc2_config_fifo_fixed_dma(&priv->const_cfg, &priv->fifo);
+
+	/* Init GUSBCFG */
+	dwc2_hal_init_gusbcfg(dev);
+
+	/* Init GAHBCFG */
+	dwc2_hal_init_gahbcfg(dev);
+
+	/* Clear interrupts */
+	sys_clear_bits((mem_addr_t)&dwc2->gintmsk, 0xFFFFFFFFUL);
+	sys_set_bits((mem_addr_t)&dwc2->gintmsk, USB_DWC2_GINTSTS_DISCONNINT);
+
+	/* Clear status */
+	uint32_t core_intrs = sys_read32((mem_addr_t)&dwc2->gintsts);
+	sys_write32(core_intrs, (mem_addr_t)&dwc2->gintsts);
+}
+
+
+/* ---------------------------- */
+
 static void uhc_dwc2_isr_handler(const struct device *dev)
 {
 	/* TODO: Interrupt handling */
@@ -135,16 +245,126 @@ static int uhc_dwc2_preinit(const struct device *const dev)
 
 static int uhc_dwc2_init(const struct device *const dev)
 {
-	LOG_WRN("%s has not been implemented", __func__);
+	// struct uhc_dwc2_data *priv = uhc_get_private(dev);
+	const struct uhc_dwc2_config *const config = dev->config;
+	struct usb_dwc2_reg *const dwc2 = config->base;
+	uint32_t reg;
+	int ret;
 
-	return -ENOSYS;
+	/* 1. Power-up dwc2 hardware controller */
+
+	ret = uhc_dwc2_quirk_init(dev);
+	if (ret) {
+		LOG_ERR("Quirk init failed %d", ret);
+		return ret;
+	}
+
+	/* 2. Read hardware configuration registers */
+
+	reg = sys_read32((mem_addr_t)&dwc2->gsnpsid);
+	if (reg != config->gsnpsid) {
+		LOG_ERR("Unexpected GSNPSID 0x%08x instead of 0x%08x", reg, config->gsnpsid);
+		return -ENOTSUP;
+	}
+
+	reg = sys_read32((mem_addr_t)&dwc2->ghwcfg1);
+	if (reg != config->ghwcfg1) {
+		LOG_ERR("Unexpected GHWCFG1 0x%08x instead of 0x%08x", reg, config->ghwcfg1);
+		return -ENOTSUP;
+	}
+
+	reg = sys_read32((mem_addr_t)&dwc2->ghwcfg2);
+	if (reg != config->ghwcfg2) {
+		LOG_ERR("Unexpected GHWCFG2 0x%08x instead of 0x%08x", reg, config->ghwcfg2);
+		return -ENOTSUP;
+	}
+
+	reg = sys_read32((mem_addr_t)&dwc2->ghwcfg3);
+	if (reg != config->ghwcfg3) {
+		LOG_ERR("Unexpected GHWCFG3 0x%08x instead of 0x%08x", reg, config->ghwcfg3);
+		return -ENOTSUP;
+	}
+
+	reg = sys_read32((mem_addr_t)&dwc2->ghwcfg4);
+	if (reg != config->ghwcfg4) {
+		LOG_ERR("Unexpected GHWCFG4 0x%08x instead of 0x%08x", reg, config->ghwcfg4);
+		return -ENOTSUP;
+	}
+
+	/* 3. Select PHY */
+
+	ret = uhc_dwc2_quirk_phy_pre_select(dev);
+	if (ret) {
+		LOG_ERR("Quirk PHY pre select failed %d", ret);
+		return ret;
+	}
+
+	if (uhc_dwc2_quirk_is_phy_clk_off(dev)) {
+		LOG_ERR("PHY clock is  turned off, cannot reset");
+		return -EIO;
+	}
+
+	ret = dwc2_hal_core_reset(dwc2, K_MSEC(10));
+	if (ret) {
+		LOG_ERR("DWC2 core reset failed after PHY init: %d", ret);
+		return ret;
+	}
+
+	ret = uhc_dwc2_quirk_phy_post_select(dev);
+	if (ret) {
+		LOG_ERR("Quirk PHY post select failed %d", ret);
+		return ret;
+	}
+
+	/* 4. Init DWC2 controller as host */
+	ret = dwc2_hal_init_host(dwc2);
+	if (ret) {
+		return ret;
+	}
+
+	LOG_WRN("%s OK", __func__);
+
+	return 0;
 }
 
 static int uhc_dwc2_enable(const struct device *const dev)
 {
-	LOG_WRN("%s has not been implemented", __func__);
+	const struct uhc_dwc2_config *const config = dev->config;
 
-	return -ENOSYS;
+	int ret;
+
+	ret = uhc_dwc2_quirk_pre_enable(dev);
+	if (ret) {
+		LOG_ERR("Quirk pre enable failed %d", ret);
+		return ret;
+	}
+
+	/* 1. Init root port */
+
+	// priv->channels.hdls = k_malloc(priv->const_cfg.numchannels * sizeof(uhc_dwc2_channel_t*));
+	// if (priv->channels.hdls == NULL) {
+	// 	LOG_ERR("Failed to allocate channel handles");
+	// 	return -ENOMEM;
+	// }
+
+	// for (uint8_t i = 0; i < priv->const_cfg.numchannels; i++) {
+	// 	priv->channels.hdls[i] = NULL;
+	// }
+
+
+	/* 2. Enable IRQ */
+	config->irq_enable_func(dev);
+
+	/* 3. Power up root port */
+	// ret = uhc_dwc2_power_on(dev);
+	// if (ret) {
+	// 	LOG_ERR("Failed to power on port: %d", ret);
+	// 	return ret;
+	// }
+
+	LOG_WRN("%s OK", __func__);
+
+	return 0;
 }
 
 static int uhc_dwc2_disable(const struct device *const dev)
@@ -268,6 +488,11 @@ static const struct uhc_api uhc_dwc2_api = {
 		.make_thread = uhc_dwc2_make_thread_##n,	\
 		.irq_enable_func = uhc_dwc2_irq_enable_func_##n,	\
 		.irq_disable_func = uhc_dwc2_irq_disable_func_##n,	\
+		.gsnpsid = DT_INST_PROP(n, gsnpsid),	\
+		.ghwcfg1 = DT_INST_PROP(n, ghwcfg1),	\
+		.ghwcfg2 = DT_INST_PROP(n, ghwcfg2),	\
+		.ghwcfg3 = DT_INST_PROP(n, ghwcfg3),	\
+		.ghwcfg4 = DT_INST_PROP(n, ghwcfg4),	\
 	};									\
 										\
 	DEVICE_DT_INST_DEFINE(n, uhc_dwc2_preinit, NULL,	\
